@@ -10,6 +10,7 @@ from typing import Tuple, List, Dict, Union
 from torch import Tensor
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
+from torch_scatter import scatter
 import torch
 from torch import nn
 from torch_geometric.typing import (
@@ -43,7 +44,12 @@ class RGCN(nn.Module):
             'atom_embedding_out': self.atom_embedding_out,
             'num_relation': self.num_relation,
         }
-    def forward(self, x, edge_index, edge_type, batch=None):
+    def forward(self, data):
+        x=data.atom_type
+        edge_index=data.edge_index
+        edge_type=data.edge_type
+        batch=data.batch
+        #x, edge_index, edge_type, batch=None
         h=self.atom_embedding(x)
         if len(edge_type.shape)>1:
             edge_type = edge_type[:,0].long()

@@ -9,6 +9,7 @@ from typing import Tuple, List, Dict, Union
 from torch import Tensor
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
+from torch_scatter import scatter
 import torch
 from torch import nn
 from torch_geometric.typing import (

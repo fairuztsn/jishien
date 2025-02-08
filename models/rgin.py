@@ -9,6 +9,7 @@ from typing import Tuple, List, Dict, Union
 from torch import Tensor
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
+from torch_scatter import scatter
 import torch
 from torch import nn
 from torch_geometric.typing import (
@@ -101,7 +102,10 @@ class RGIN(nn.Module):
                  edge_combiner_inner_dims,
                  edge_combiner_o,
                  dropout_rate=0.0, 
-                 aggr: str = 'sum'):
+                 aggr: str = 'sum',
+                 ang_delta_norm_momentum=0.01,
+                 anchor_ang_norm_momentum=0.01,
+                ):
         super().__init__()
         __A=l_atom_emb_o
         __B=r_atom_emb_o
@@ -110,27 +114,23 @@ class RGIN(nn.Module):
         __E=l_bond_emb_o
         __F=r_bond_emb_o
         __G=anchor_bond_emb_o
-        #O1=15
-        #O2=22
-        self.atom_type_emb = nn.Embedding(atom_emb_i, atom_emb_o)#nn.Embedding(len(ATOMIC_SYMBOL),O1)
-        self.bond_type_emb = nn.Embedding(bond_emb_i, bond_emb_o)#nn.Embedding(len(BONDTYPE),O2)
-        #A=B=C=D=15
-        self.l_atom_type_emb = nn.Embedding(l_atom_emb_i, l_atom_emb_o)#nn.Embedding(len(ATOMIC_SYMBOL),A)
-        self.r_atom_type_emb = nn.Embedding(r_atom_emb_i, r_atom_emb_o)#nn.Embedding(len(ATOMIC_SYMBOL),B)
-        self.anchor_orig_atom_type_emb = nn.Embedding(orig_atom_emb_i, orig_atom_emb_o)#nn.Embedding(len(ATOMIC_SYMBOL),C)
-        self.anchor_dest_atom_type_emb = nn.Embedding(dest_atom_emb_i, dest_atom_emb_o)#nn.Embedding(len(ATOMIC_SYMBOL),D)
-        #E=F=G=len(BONDTYPE)
-        self.l_bond_type_emb = nn.Embedding(l_bond_emb_i, l_bond_emb_o)#nn.Embedding(len(BONDTYPE),E)
-        self.r_bond_type_emb = nn.Embedding(r_bond_emb_i, r_bond_emb_o)#nn.Embedding(len(BONDTYPE),F)
-        self.anchor_bond_type_emb = nn.Embedding(anchor_bond_emb_i, anchor_bond_emb_o)#nn.Embedding(len(BONDTYPE),G)
+        self.atom_type_emb = nn.Embedding(atom_emb_i, atom_emb_o)
+        self.bond_type_emb = nn.Embedding(bond_emb_i, bond_emb_o)
+        self.l_atom_type_emb = nn.Embedding(l_atom_emb_i, l_atom_emb_o)
+        self.r_atom_type_emb = nn.Embedding(r_atom_emb_i, r_atom_emb_o)
+        self.anchor_orig_atom_type_emb = nn.Embedding(orig_atom_emb_i, orig_atom_emb_o)
+        self.anchor_dest_atom_type_emb = nn.Embedding(dest_atom_emb_i, dest_atom_emb_o)
+        self.l_bond_type_emb = nn.Embedding(l_bond_emb_i, l_bond_emb_o)
+        self.r_bond_type_emb = nn.Embedding(r_bond_emb_i, r_bond_emb_o)
+        self.anchor_bond_type_emb = nn.Embedding(anchor_bond_emb_i, anchor_bond_emb_o)
         
         self.rgins = nn.ModuleList([
             RGINConv(mlp_dims_node, mlp_dims_edge, dropout_rate=dropout_rate, aggr=aggr)
             for mlp_dims_node, mlp_dims_edge in zip(node_dimses, edge_dimses)
         ])
-
-        self.ring_aggregator_mlp=MLP(__A+__B+__C+__D+__E+__F+__G+1,ring_agg_inner_dims,ring_agg_o)#MLP(__A+__B+__C+__D+__E+__F+__G+1,[50,64],22)
-        self.aggregator_edge_combined = MLP(bond_emb_o+ring_agg_o,edge_combiner_inner_dims,edge_combiner_o)#MLP(22+22,[50,64],22)
+        
+        self.ring_aggregator_mlp=MLP(__A+__B+__C+__D+__E+__F+__G+2,ring_agg_inner_dims,ring_agg_o)
+        self.aggregator_edge_combined = MLP(bond_emb_o+ring_agg_o,edge_combiner_inner_dims,edge_combiner_o)
 
         self.node_dimses=node_dimses 
         self.edge_dimses=edge_dimses 
@@ -158,6 +158,10 @@ class RGIN(nn.Module):
         self.edge_combiner_o=edge_combiner_o
         self.dropout_rate=dropout_rate
         self.aggr=aggr
+        self.ang_delta_norm_momentum=ang_delta_norm_momentum
+        self.anchor_ang_norm_momentum=anchor_ang_norm_momentum
+        self.ang_delta_norm=nn.BatchNorm1d(1,momentum=ang_delta_norm_momentum)
+        self.anchor_ang_norm=nn.BatchNorm1d(1,momentum=anchor_ang_norm_momentum)
 
     @classmethod
     def from_config(cls, config):
@@ -191,27 +195,42 @@ class RGIN(nn.Module):
             'edge_combiner_o':          self.edge_combiner_o,
             'dropout_rate':             self.dropout_rate,
             'aggr':                     self.aggr,
+            'ang_delta_norm_momentum':  self.ang_delta_norm_momentum,
+            'anchor_ang_norm_momentum': self.anchor_ang_norm_momentum,
         }
     
         
     def forward(self, 
-                atom_type: Tensor,      # [|V|]
-                edge_index: Adj,        # [2,|E|]
-                edge_type: Tensor,      # [|E|]
-                bond_anchor: Tensor,    # [|C|]
-                bond_inbound: Tensor,   # [|C|, 2]
-                angle_deltas: Tensor,   # [|C|]
-                batch=None):
+                data
+                #atom_type: Tensor,      # [|V|]
+                #edge_index: Adj,        # [2,|E|]
+                #edge_type: Tensor,      # [|E|]
+                #bond_anchor: Tensor,    # [|C|]
+                #bond_inbound: Tensor,   # [|C|, 2]
+                #angle_deltas: Tensor,   # [|C|]
+                #batch=None
+               ):
+        
+        atom_type=data.atom_type
+        edge_index=data.edge_index
+        edge_type=data.edge_type
+        bond_anchor=data.dest
+        bond_inbound=data.inbound
+        angle_deltas=data.ang_deltas.unsqueeze(-1)
+        angle_deltas=self.ang_delta_norm(angle_deltas)
+        anchor_ang=data.anchor_ang.unsqueeze(-1)
+        anchor_ang=self.anchor_ang_norm(anchor_ang)
+        batch=data.batch
         
         l_edge_type = edge_type[bond_inbound[:,0]] # [|C|]
         r_edge_type = edge_type[bond_inbound[:,1]] # [|C|]
         anchor_type = edge_type[bond_anchor]       # [|C|]
-        assert l_edge_type.shape==r_edge_type.shape==anchor_type.shape==bond_anchor.shape
+        assert l_edge_type.shape==r_edge_type.shape==anchor_type.shape==bond_anchor.shape, f'{l_edge_type.shape}, {r_edge_type.shape}, {anchor_type.shape}, {bond_anchor.shape}'
         l_atom_type = atom_type[edge_index[0,bond_inbound[:,0]]]
         r_atom_type = atom_type[edge_index[0,bond_inbound[:,1]]]
         anchor_orig_atom_type = atom_type[edge_index[0,bond_anchor]]
         anchor_dest_atom_type = atom_type[edge_index[1,bond_anchor]]
-        assert l_atom_type.shape==r_atom_type.shape==anchor_orig_atom_type.shape==anchor_dest_atom_type.shape==bond_anchor.shape
+        assert l_atom_type.shape==r_atom_type.shape==anchor_orig_atom_type.shape==anchor_dest_atom_type.shape==bond_anchor.shape, f'{l_atom_type.shape}, {r_atom_type.shape}, {anchor_orig_atom_type.shape}, {anchor_dest_atom_type.shape}, {bond_anchor.shape}'
 
         l_edge_emb = self.l_bond_type_emb(l_edge_type) #[|C|,D_b]
         r_edge_emb = self.r_bond_type_emb(r_edge_type) #[|C|,D_b]
@@ -232,7 +251,8 @@ class RGIN(nn.Module):
             anchor_orig_emb,
             anchor_dest_emb,
 
-            angle_deltas.view(-1,1)
+            angle_deltas,#.view(-1,1),
+            anchor_ang,#.view(-1,1),
         ],-1) 
         combined_ring_conv_map=self.ring_aggregator_mlp(combined_ring_conv_map)
         #print("combined_ring_conv_map.T:",combined_ring_conv_map.T.shape)
@@ -252,7 +272,7 @@ class RGIN(nn.Module):
         ########################
         for i,rgin in enumerate(self.rgins):
             h = rgin(h, edge_index, combined_edge)
-            if i+1<len(self.rginns):
+            if i+1<len(self.rgins):
                 h=h.tanh()
         if batch is not None:
             h= scatter(h,batch,dim=0,reduce='mean').mean(-1)
